@@ -38,32 +38,6 @@ logger = logging.getLogger(__name__)
 class StreamlinedImageProcessor:
     """Downloads images and replaces logos in one streamlined process."""
     
-    def update_image_url_in_db(self, section_id: int, old_url: str, new_url: str):
-        """Update the image URL in the database for a given section and old URL."""
-        try:
-            connection = self.connect_to_database()
-            cursor = connection.cursor()
-            # Update the JSON content in the 'content' field of the report_sections table
-            # Replace old_url with new_url in the JSON string
-            update_query = """
-                UPDATE report_sections
-                SET content = REPLACE(content, %s, %s)
-                WHERE id = %s
-            """
-            cursor.execute(update_query, (old_url, new_url, section_id))
-            connection.commit()
-            logger.info(f"✅ Updated DB: section {section_id} | {old_url} -> {new_url}")
-        except Exception as e:
-            logger.error(f"❌ Failed to update DB for section {section_id}: {e}")
-        finally:
-            try:
-                if cursor:
-                    cursor.close()
-                if connection and connection.is_connected():
-                    connection.close()
-            except Exception:
-                pass
-    
     def __init__(self):
         """Initialize the processor."""
         # Database configuration
@@ -165,6 +139,43 @@ class StreamlinedImageProcessor:
         except mysql.connector.Error as e:
             logger.error(f"Error connecting to MySQL: {e}")
             raise
+    
+    def update_image_url_in_db(self, section_id: int, old_url: str, new_url: str):
+        """Update the image URL in the database for a given section and old URL."""
+        connection = None
+        cursor = None
+        try:
+            connection = self.connect_to_database()
+            cursor = connection.cursor()
+            
+            # Update the JSON content in the 'content' field of the report_sections table
+            # Replace old_url with new_url in the JSON string
+            update_query = """
+                UPDATE report_sections
+                SET content = REPLACE(content, %s, %s)
+                WHERE id = %s
+            """
+            cursor.execute(update_query, (old_url, new_url, section_id))
+            affected_rows = cursor.rowcount
+            connection.commit()
+            
+            if affected_rows > 0:
+                logger.info(f"✅ Updated DB: section {section_id} | {old_url} -> {new_url}")
+            else:
+                logger.warning(f"⚠️ No rows updated for section {section_id} - URL might not exist: {old_url}")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to update DB for section {section_id}: {e}")
+            if connection:
+                connection.rollback()
+        finally:
+            try:
+                if cursor:
+                    cursor.close()
+                if connection and connection.is_connected():
+                    connection.close()
+            except Exception:
+                pass
     
     def fetch_report_sections(self, report_id: Optional[int] = None):
         """Fetch report sections from database."""
@@ -787,11 +798,28 @@ class StreamlinedImageProcessor:
                         })
                         # If mapping info is available, update DB
                         if image_db_map:
-                            info = image_db_map.get(local_path)
+                            # Try both absolute and normalized paths to find the mapping
+                            abs_local_path = os.path.abspath(local_path)
+                            info = image_db_map.get(abs_local_path) or image_db_map.get(local_path)
+                            
                             if info:
                                 section_id, old_url = info['section_id'], info['old_url']
-                                s3_url = f"https://{self.s3_config['bucket_name']}.s3.{self.s3_config['region_name']}.amazonaws.com/{s3_key}"
+                                
+                                # Construct S3 URL - use standard format for us-east-1, regional for others
+                                if self.s3_config['region_name'] == 'us-east-1':
+                                    s3_url = f"https://{self.s3_config['bucket_name']}.s3.amazonaws.com/{s3_key}"
+                                else:
+                                    s3_url = f"https://{self.s3_config['bucket_name']}.s3.{self.s3_config['region_name']}.amazonaws.com/{s3_key}"
+                                
+                                logger.info(f"🔄 Updating DB: section {section_id} | {old_url} -> {s3_url}")
                                 self.update_image_url_in_db(section_id, old_url, s3_url)
+                            else:
+                                logger.warning(f"⚠️ No DB mapping found for {local_path} or {abs_local_path}")
+                                # Debug: print available mappings
+                                if image_db_map:
+                                    logger.debug(f"Available mappings: {list(image_db_map.keys())}")
+                        else:
+                            logger.debug("No image_db_map provided - skipping DB update")
                     else:
                         upload_stats['failed'] += 1
                         upload_stats['files'].append({
